@@ -70,13 +70,13 @@ args.res_dir = os.path.join(args.file_dir, 'results/{}'.format(args.data_name))
 if args.train_name is None:
     args.data_dir = os.path.join(args.file_dir, 'data/{}.mat'.format(args.data_name))
 
-    net = np.load('data_sta/'+args.graph)
+    net = np.load('data/'+args.graph,allow_pickle=True)
 
     if False:
         net_ = net.toarray()
         assert(np.allclose(net_, net_.T, atol=1e-8))
     #Sample train and test links
-    f = np.load('data_sta/'+args.split+'.npz')
+    f = np.load('data/'+args.split+'.npz')
     train_pos_id, train_neg_id, test_pos_id, test_neg_id = f['train_pos_id'], f['train_neg_id'], f['test_pos_id'], f['test_neg_id']
     train_pos, train_neg, test_pos, test_neg = f['train_pos'], f['train_neg'], f['test_pos'], f['test_neg']
 else:
@@ -109,13 +109,13 @@ if args.use_attribute and attributes is not None:
     else:
         node_information = attributes
 
-if not path.exists('data_sta/'+args.split+'h'+str(args.hop)):
+if not path.exists('data/'+args.split+'h'+str(args.hop)):
     train_graphs, test_graphs, max_n_label = dyn_links2subgraphs(A, args.window, train_pos_id, train_pos, train_neg_id, train_neg, test_pos_id, test_pos, test_neg_id, test_neg, args.hop, args.max_nodes_per_hop, node_information)
     print(('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs))))
-    with open('data_sta/'+args.split+'h'+str(args.hop), 'wb') as f:
+    with open('data/'+args.split+'h'+str(args.hop), 'wb') as f:
         pickle.dump([train_graphs, test_graphs, max_n_label], f, protocol=4)
 else:
-    with open('data_sta/'+args.split+'h'+str(args.hop), 'rb') as f:
+    with open('data/'+args.split+'h'+str(args.hop), 'rb') as f:
         train_graphs, test_graphs, max_n_label = pickle.load(f)
         print(('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs))))
 
