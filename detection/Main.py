@@ -9,10 +9,10 @@ import os.path
 import random
 import argparse
 import pickle
-from main import *
-from util_functions import *
-from os import path
+# import main
 sys.path.append('%s/../../pytorch_DGCNN' % os.path.dirname(os.path.realpath(__file__)))
+import util_functions
+from os import path
 
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
