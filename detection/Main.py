@@ -9,7 +9,7 @@ import os.path
 import random
 import argparse
 import pickle
-# import main
+import main
 sys.path.append('%s/../pytorch_DGCNN' % os.path.dirname(os.path.realpath(__file__)))
 import util_functions
 from os import path
