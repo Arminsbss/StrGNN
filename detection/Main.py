@@ -72,7 +72,7 @@ args.res_dir = os.path.join(args.file_dir, 'results/{}'.format(args.data_name))
 if args.train_name is None:
     args.data_dir = os.path.join(args.file_dir, 'data/{}.mat'.format(args.data_name))
 
-    net = np.load('data/'+args.graph)
+    net = np.load('data/'+args.graph,allow_pickle=True)
 
     if False:
         net_ = net.toarray()
