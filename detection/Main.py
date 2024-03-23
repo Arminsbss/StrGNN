@@ -1,190 +1,252 @@
-import torch
+
 import numpy as np
-import sys, copy, math, time, pdb
-import pickle as pickle
+import random
+from tqdm import tqdm
+import os, sys, pdb, math
+import pickle as cp
+#import _pickle as cp  # python3 compatability
+import networkx as nx
+import argparse
 import scipy.io as sio
 import scipy.sparse as ssp
-import os
-import os.path
-import random
-import argparse
-import pickle
-sys.path.append('%s/../pytorch_DGCNN' % os.path.dirname(os.path.realpath(__file__)))
-from main import *
-from util_functions import *
-from util import cmd_args, load_data
-from os import path
+from sklearn import metrics
+from gensim.models import Word2Vec
+import warnings
+warnings.simplefilter('ignore', ssp.SparseEfficiencyWarning)
+cur_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append('%s/../pytorch_DGCNN' % cur_dir)
+sys.path.append('%s/software/node2vec/src' % cur_dir)
+from util import GNNGraph
+import node2vec
+
+def sample_dyn(net, test_ratio, window_size):
+    num_graphs = len(net)
+    num_train = int(math.ceil(num_graphs * (1-test_ratio)))
+    train_id = []
+    train_pos_dy=[]
+    train_neg_dy=[]
+    for i in range(window_size, num_train):
+        train_pos, train_neg, _, _ = sample_neg(net[i], 0)
+        ids = np.ones(len(train_pos[0]), dtype=int)*i
+        train_id.append(ids)
+        train_pos_dy.append(train_pos)
+        train_neg_dy.append(train_neg)
+    train_id = np.concatenate(train_id)
+    train_pos_dy = np.concatenate(train_pos_dy, axis=1)
+    train_neg_dy = np.concatenate(train_neg_dy, axis=1)
+    test_id = []
+    test_pos_dy=[]
+    test_neg_dy=[]
+    for i in range(num_train, num_graphs):
+        train_pos, train_neg, _, _ = sample_neg(net[i], 0)
+        ids = np.ones(len(train_pos[0]), dtype=int)*i
+        test_id.append(ids)
+        test_pos_dy.append(train_pos)
+        test_neg_dy.append(train_neg)
+    test_id = np.concatenate(test_id)
+    test_pos_dy = np.concatenate(test_pos_dy, axis=1)
+    test_neg_dy = np.concatenate(test_neg_dy, axis=1)
+    return train_id, train_pos_dy, train_neg_dy, test_id, test_pos_dy, test_neg_dy
+
+def sample_neg(net, test_ratio=0.1, train_pos=None, test_pos=None, max_train_num=None):
+    # get upper triangular matrix
+    net_triu = ssp.triu(net, k=1)
+    # sample positive links for train/test
+    row, col, _ = ssp.find(net_triu)
+    # sample positive links if not specified
+    if train_pos is None or test_pos is None:
+        perm = random.sample(list(range(len(row))), len(row))
+        row, col = row[perm], col[perm]
+        split = int(math.ceil(len(row) * (1 - test_ratio)))
+        train_pos = (row[:split], col[:split])
+        test_pos = (row[split:], col[split:])
+    # if max_train_num is set, randomly sample train links
+    if max_train_num is not None:
+        perm = np.random.permutation(len(train_pos[0]))[:max_train_num]
+        train_pos = (train_pos[0][perm], train_pos[1][perm])
+    # sample negative links for train/test
+    train_num, test_num = len(train_pos[0]), len(test_pos[0])
+    neg = ([], [])
+    n = net.shape[0]
+    print('sampling negative links for train and test')
+    while len(neg[0]) < train_num + test_num:
+        i, j = random.randint(0, n-1), random.randint(0, n-1)
+        if i < j and net[i, j] == 0:
+            neg[0].append(i)
+            neg[1].append(j)
+        else:
+            continue
+    train_neg  = (neg[0][:train_num], neg[1][:train_num])
+    test_neg = (neg[0][train_num:], neg[1][train_num:])
+    return train_pos, train_neg, test_pos, test_neg
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+def dyn_links2subgraphs(net, window_size, train_pos_id, train_pos, train_neg_id, train_neg, test_pos_id, test_pos, test_neg_id, test_neg, h=1, max_nodes_per_hop=None, node_information=None):
+    max_n_label = {'value': 0}
+    def helper(net, links, train_id, g_label, window_size):
+        g_list = []
+        for i, j, n in tqdm(list(zip(links[0], links[1], train_id))):
+            d_list = []
+            for g_id in range(n-window_size+1, n+1):
+                g, n_labels, n_features = subgraph_extraction_labeling((i,j), net[g_id], h, max_nodes_per_hop, node_information)
+                max_n_label['value'] = max(max(n_labels), max_n_label['value'])
+                d_list.append(GNNGraph(g, g_label, n_labels, n_features))
+            g_list.append(d_list)
+        return g_list
+    print('Enclosing subgraph extraction begins...')
+    train_graphs = helper(net, train_pos, train_pos_id, 1, window_size) + helper(net, train_neg, train_neg_id, 0, window_size)
+    test_graphs = helper(net, test_pos, test_pos_id, 1, window_size) + helper(net, test_neg, test_neg_id, 0, window_size)
+    print(max_n_label)
+    return train_graphs, test_graphs, max_n_label['value']
+   
+def links2subgraphs(A, train_pos, train_neg, test_pos, test_neg, h=1, max_nodes_per_hop=None, node_information=None):
+    # automatically select h from {1, 2}
+    if h == 'auto':
+        # split train into val_train and val_test
+        _, _, val_test_pos, val_test_neg = sample_neg(A, 0.1)
+        val_A = A.copy()
+        val_A[val_test_pos[0], val_test_pos[1]] = 0
+        val_A[val_test_pos[1], val_test_pos[0]] = 0
+        val_auc_CN = CN(val_A, val_test_pos, val_test_neg)
+        val_auc_AA = AA(val_A, val_test_pos, val_test_neg)
+        print('\033[91mValidation AUC of AA is {}, CN is {}\033[0m'.format(val_auc_AA, val_auc_CN))
+        if val_auc_AA >= val_auc_CN:
+            h = 2
+            print('\033[91mChoose h=2\033[0m')
+        else:
+            h = 1
+            print('\033[91mChoose h=1\033[0m')
 
-parser = argparse.ArgumentParser(description='Anomaly detection')
-# general settings
-parser.add_argument('--data-name', default='USAir', help='network name')
-parser.add_argument('--train-name', default=None, help='train name')
-parser.add_argument('--test-name', default=None, help='test name')
-parser.add_argument('--max-train-num', type=int, default=100000, 
-                    help='set maximum number of train links (to fit into memory)')
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='disables CUDA training')
-parser.add_argument('--seed', type=int, default=1, metavar='S',
-                    help='random seed (default: 1)')
-parser.add_argument('--test-ratio', type=float, default=0.815,
-                    help='ratio of test links')
-parser.add_argument('--window', type=int, default=5,
-                    help='window size')
-parser.add_argument('--graph', default='asi.npy')
-parser.add_argument('--split', default='digg0.1')
-parser.add_argument('--gpu', default='1', help='gpu number')
-# model settings
-parser.add_argument('--hop', default=1, metavar='S', 
-                    help='enclosing subgraph hop number, \
-                    options: 1, 2,..., "auto"')
-parser.add_argument('--max-nodes-per-hop', default=None, 
-                    help='if > 0, upper bound the # nodes per hop by subsampling')
-parser.add_argument('--use-embedding', action='store_true', default=False,
-                    help='whether to use node2vec node embeddings')
-parser.add_argument('--use-attribute', action='store_true', default=False,
-                    help='whether to use node attributes')
-args = parser.parse_args()
-
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-torch.manual_seed(args.seed)
-if args.cuda:
-    torch.cuda.manual_seed(args.seed)
-print(args)
-
-random.seed(cmd_args.seed)
-np.random.seed(cmd_args.seed)
-torch.manual_seed(cmd_args.seed)
-if args.hop != 'auto':
-    args.hop = int(args.hop)
-if args.max_nodes_per_hop is not None:
-    args.max_nodes_per_hop = int(args.max_nodes_per_hop)
-
-
-'''Prepare data'''
-args.file_dir = os.path.dirname(os.path.realpath('__file__'))
-args.res_dir = os.path.join(args.file_dir, 'results/{}'.format(args.data_name))
-
-if args.train_name is None:
-    args.data_dir = os.path.join(args.file_dir, 'data/{}.mat'.format(args.data_name))
-
-    net = np.load('data/'+args.graph,allow_pickle=True)
-
-    if False:
-        net_ = net.toarray()
-        assert(np.allclose(net_, net_.T, atol=1e-8))
-    #Sample train and test links
-    f = np.load('data/'+args.split+'.npz')
-    train_pos_id, train_neg_id, test_pos_id, test_neg_id = f['train_pos_id'], f['train_neg_id'], f['test_pos_id'], f['test_neg_id']
-    train_pos, train_neg, test_pos, test_neg = f['train_pos'], f['train_neg'], f['test_pos'], f['test_neg']
-else:
-    args.train_dir = os.path.join(args.file_dir, 'data/{}'.format(args.train_name))
-    args.test_dir = os.path.join(args.file_dir, 'data/{}'.format(args.test_name))
-    train_idx = np.loadtxt(args.train_dir, dtype=int)
-    test_idx = np.loadtxt(args.test_dir, dtype=int)
-    max_idx = max(np.max(train_idx), np.max(test_idx))
-    net = ssp.csc_matrix((np.ones(len(train_idx)), (train_idx[:, 0], train_idx[:, 1])), shape=(max_idx+1, max_idx+1))
-    net[train_idx[:, 1], train_idx[:, 0]] = 1  # add symmetric edges
-    net[np.arange(max_idx+1), np.arange(max_idx+1)] = 0  # remove self-loops
-    #Sample negative train and test links
-    train_pos = (train_idx[:, 0], train_idx[:, 1])
-    test_pos = (test_idx[:, 0], test_idx[:, 1])
-    train_pos, train_neg, test_pos, test_neg = sample_dyn(net, train_pos=train_pos, test_pos=test_pos, max_train_num=args.max_train_num)
+    # extract enclosing subgraphs
+    max_n_label = {'value': 0}
+    def helper(A, links, g_label):
+        g_list = []
+        for i, j in tqdm(list(zip(links[0], links[1]))):
+            g, n_labels, n_features = subgraph_extraction_labeling((i, j), A, h, max_nodes_per_hop, node_information)
+            max_n_label['value'] = max(max(n_labels), max_n_label['value'])
+            g_list.append(GNNGraph(g, g_label, n_labels, n_features))
+        return g_list
+    print('Enclosing subgraph extraction begins...')
+    train_graphs = helper(A, train_pos, 1) + helper(A, train_neg, 0)
+    test_graphs = helper(A, test_pos, 1) + helper(A, test_neg, 0)
+    print(max_n_label)
+    return train_graphs, test_graphs, max_n_label['value']
 
 
-'''Train and apply classifier'''
-A = net.copy()  # the observed network
-# A[test_pos[0], test_pos[1]] = 0  # mask test links
-# A[test_pos[1], test_pos[0]] = 0  # mask test links
-
-node_information = None
-if args.use_embedding:
-    embeddings = generate_node2vec_embeddings(A, 128, True, train_neg)
-    node_information = embeddings
-if args.use_attribute and attributes is not None:
+def subgraph_extraction_labeling(ind, A, h=1, max_nodes_per_hop=None, node_information=None):
+    # extract the h-hop enclosing subgraph around link 'ind'
+    dist = 0
+    nodes = set([ind[0], ind[1]])
+    visited = set([ind[0], ind[1]])
+    fringe = set([ind[0], ind[1]])
+    nodes_dist = [0, 0]
+    for dist in range(1, h+1):
+        fringe = neighbors(fringe, A)
+        fringe = fringe - visited
+        visited = visited.union(fringe)
+        if max_nodes_per_hop is not None:
+            if max_nodes_per_hop < len(fringe):
+                fringe = random.sample(fringe, max_nodes_per_hop)
+        if len(fringe) == 0:
+            break
+        nodes = nodes.union(fringe)
+        nodes_dist += [dist] * len(fringe)
+    # move target nodes to top
+    nodes.remove(ind[0])
+    nodes.remove(ind[1])
+    nodes = [ind[0], ind[1]] + list(nodes) 
+    subgraph = A[nodes, :][:, nodes]
+    # apply node-labeling
+    labels = node_label(subgraph)
+    # get node features
+    features = None
     if node_information is not None:
-        node_information = np.concatenate([node_information, attributes], axis=1)
-    else:
-        node_information = attributes
-
-if not path.exists('data/'+args.split+'h'+str(args.hop)):
-    train_graphs, test_graphs, max_n_label = dyn_links2subgraphs(A, args.window, train_pos_id, train_pos, train_neg_id, train_neg, test_pos_id, test_pos, test_neg_id, test_neg, args.hop, args.max_nodes_per_hop, node_information)
-    print(('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs))))
-    with open('data/'+args.split+'h'+str(args.hop), 'wb') as f:
-        pickle.dump([train_graphs, test_graphs, max_n_label], f, protocol=4)
-else:
-    with open('data/'+args.split+'h'+str(args.hop), 'rb') as f:
-        train_graphs, test_graphs, max_n_label = pickle.load(f)
-        print(('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs))))
+        features = node_information[nodes]
+    # construct nx graph
+    g = nx.from_scipy_sparse_array(subgraph)
+    # remove link between target nodes
+    if g.has_edge(0, 1):
+        g.remove_edge(0, 1)
+    return g, labels.tolist(), features
 
 
+def neighbors(fringe, A):
+    # find all 1-hop neighbors of nodes in fringe from A
+    res = set()
+    for node in fringe:
+        nei, _, _ = ssp.find(A[:, node])
+        nei = set(nei)
+        res = res.union(nei)
+    return res
 
-# DGCNN configurations
-cmd_args.gm = 'DGCNN'
-cmd_args.sortpooling_k = 0.6
-cmd_args.latent_dim = [32, 32, 32, 1]
-cmd_args.hidden = 128
-cmd_args.out_dim = 0
-cmd_args.dropout = True
-cmd_args.num_class = 2
-cmd_args.mode = 'gpu'
-cmd_args.num_epochs = 50
-cmd_args.learning_rate = 1e-4
-cmd_args.batch_size = 32
-cmd_args.printAUC = True
-cmd_args.feat_dim = max_n_label + 1
-cmd_args.attr_dim = 0
-cmd_args.window = 5
-if node_information is not None:
-    cmd_args.attr_dim = node_information.shape[1]
-if cmd_args.sortpooling_k <= 1:
-    A = []
-    for i in train_graphs:
-        #print(type(i[-1]))
-        A.append(i[-1])
-    for i in test_graphs:
-        A.append(i[-1])   
-    #print(type(A[0]))
-    num_nodes_list = sorted([g.num_nodes for g in A])
-    cmd_args.sortpooling_k = num_nodes_list[int(math.ceil(cmd_args.sortpooling_k * len(num_nodes_list))) - 1]
-    cmd_args.sortpooling_k = max(10, cmd_args.sortpooling_k)
-    print(('k used in SortPooling is: ' + str(cmd_args.sortpooling_k)))
 
-classifier = Classifier()
-if cmd_args.mode == 'gpu':
-    classifier = classifier.cuda()
+def node_label(subgraph):
+    # an implementation of the proposed double-radius node labeling (DRNL)
+    K = subgraph.shape[0]
+    subgraph_wo0 = subgraph[1:, 1:]
+    subgraph_wo1 = subgraph[[0]+list(range(2, K)), :][:, [0]+list(range(2, K))]
+    dist_to_0 = ssp.csgraph.shortest_path(subgraph_wo0, directed=False, unweighted=True)
+    dist_to_0 = dist_to_0[1:, 0]
+    dist_to_1 = ssp.csgraph.shortest_path(subgraph_wo1, directed=False, unweighted=True)
+    dist_to_1 = dist_to_1[1:, 0]
+    d = (dist_to_0 + dist_to_1).astype(int)
+    d_over_2, d_mod_2 = np.divmod(d, 2)
+    labels = 1 + np.minimum(dist_to_0, dist_to_1).astype(int) + d_over_2 * (d_over_2 + d_mod_2 - 1)
+    labels = np.concatenate((np.array([1, 1]), labels))
+    labels[np.isinf(labels)] = 0
+    labels[labels>1e6] = 0  # set inf labels to 0
+    labels[labels<-1e6] = 0  # set -inf labels to 0
+    return labels
 
-optimizer = optim.Adam(classifier.parameters(), lr=cmd_args.learning_rate)
+def generate_node2vec_embeddings(A, emd_size=128, negative_injection=False, train_neg=None):
+    if negative_injection:
+        row, col = train_neg
+        A = A.copy()
+        A[row, col] = 1  # inject negative train
+        A[col, row] = 1  # inject negative train
+    nx_G = nx.from_scipy_sparse_matrix(A)
+    G = node2vec.Graph(nx_G, is_directed=False, p=1, q=1)
+    G.preprocess_transition_probs()
+    walks = G.simulate_walks(num_walks=10, walk_length=80)
+    walks = [list(map(str, walk)) for walk in walks]
+    model = Word2Vec(walks, size=emd_size, window=10, min_count=0, sg=1, 
+            workers=8, iter=1)
+    wv = model.wv
+    embeddings = np.zeros([A.shape[0], emd_size], dtype='float32')
+    sum_embeddings = 0
+    empty_list = []
+    for i in range(A.shape[0]):
+        if str(i) in wv:
+            embeddings[i] = wv.word_vec(str(i))
+            sum_embeddings += embeddings[i]
+        else:
+            empty_list.append(i)
+    mean_embedding = sum_embeddings / (A.shape[0] - len(empty_list))
+    embeddings[empty_list] = mean_embedding
+    return embeddings
 
-train_idxes = list(range(len(train_graphs)))
-best_loss = None
-best_auc = 0
-for epoch in range(cmd_args.num_epochs):
-    random.shuffle(train_idxes)
-    classifier.train()
-    avg_loss = loop_dataset(train_graphs, classifier, train_idxes, optimizer=optimizer)
-    if not cmd_args.printAUC:
-        avg_loss[2] = 0.0
-    print(('\033[92maverage training of epoch %d: loss %.5f acc %.5f auc %.5f\033[0m' % (epoch, avg_loss[0], avg_loss[1], avg_loss[2])))
 
-    classifier.eval()
-    test_loss = loop_dataset(test_graphs, classifier, list(range(len(test_graphs))))
-    if not cmd_args.printAUC:
-        test_loss[2] = 0.0
-    print(('\033[93maverage test of epoch %d: loss %.5f acc %.5f auc %.5f avg_precision %.5f precision-recall auc %.5f\033[0m' % (epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3], test_loss[4])))
-    if test_loss[2] > best_auc:
-        best_auc = test_loss[2]
+def AA(A, test_pos, test_neg):
+    # Adamic-Adar score
+    A_ = A / np.log(A.sum(axis=1))
+    A_[np.isnan(A_)] = 0
+    A_[np.isinf(A_)] = 0
+    sim = A.dot(A_)
+    return CalcAUC(sim, test_pos, test_neg)
+    
+        
+def CN(A, test_pos, test_neg):
+    # Common Neighbor score
+    sim = A.dot(A)
+    return CalcAUC(sim, test_pos, test_neg)
 
-print('best_auc = ', best_auc)
 
-# with open('acc_results.txt', 'a+') as f:
-#     f.write(str(test_loss[1]) + '\n')
-
-# if cmd_args.printAUC:
-#     with open('auc_results.txt', 'a+') as f:
-#         f.write(str(test_loss[2]) + '\n')
+def CalcAUC(sim, test_pos, test_neg):
+    pos_scores = np.asarray(sim[test_pos[0], test_pos[1]]).squeeze()
+    neg_scores = np.asarray(sim[test_neg[0], test_neg[1]]).squeeze()
+    scores = np.concatenate([pos_scores, neg_scores])
+    labels = np.hstack([np.ones(len(pos_scores)), np.zeros(len(neg_scores))])
+    fpr, tpr, _ = metrics.roc_curve(labels, scores, pos_label=1)
+    auc = metrics.auc(fpr, tpr)
+    return auc
 
