@@ -14,7 +14,7 @@ from gensim.models import Word2Vec
 import warnings
 warnings.simplefilter('ignore', ssp.SparseEfficiencyWarning)
 cur_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append('%s/../../pytorch_DGCNN' % cur_dir)
+sys.path.append('%s/../pytorch_DGCNN' % cur_dir)
 sys.path.append('%s/software/node2vec/src' % cur_dir)
 from util import GNNGraph
 import node2vec
